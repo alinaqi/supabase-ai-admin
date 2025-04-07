@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import anthropic
 import sys
 from tqdm import tqdm
+from supabase import create_client, Client
 
 # Load environment variables from .env file (if it exists)
 load_dotenv()
@@ -29,6 +30,9 @@ LOCAL_PG_CONNECTION = os.getenv("LOCAL_PG_CONNECTION", "postgresql://postgres:po
 
 # Anthropic API Key
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# Initialize Supabase client
+supabase: Client = create_client(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
 
 def check_environment_vars(mode):
     """Check if all required environment variables are set based on the mode."""
@@ -70,73 +74,20 @@ def get_db_connection_string(url, service_key):
 
 def get_tables(connection_string):
     """Get all user-defined tables in the public schema."""
-    cmd = [
-        "pg_dump",
-        "--schema-only",
-        "--no-owner",
-        "--no-acl",
-        "--schema=public",
-        connection_string
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"Error executing pg_dump: {result.stderr}")
-        exit(1)
-    
-    schema_dump = result.stdout
-    
-    # Write the schema to a temporary file for analysis
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sql') as temp_file:
-        temp_file.write(schema_dump)
-        temp_file_path = temp_file.name
-    
-    # Extract table names using grep
-    grep_cmd = ["grep", "-E", "^CREATE TABLE public\\.", temp_file_path]
-    grep_result = subprocess.run(grep_cmd, capture_output=True, text=True)
-    
-    # Clean up the temporary file
-    os.unlink(temp_file_path)
-    
-    if grep_result.returncode > 1:  # grep returns 0 for match, 1 for no match, >1 for error
-        print(f"Error extracting table names: {grep_result.stderr}")
-        return []
-    
-    table_lines = grep_result.stdout.strip().split('\n')
-    tables = []
-    
-    # Handle the case where no tables are found
-    if table_lines == ['']:
-        return []
-    
-    for line in table_lines:
-        if line:
-            # Extract table name from CREATE TABLE statement
-            # Example: CREATE TABLE public.users (
-            table_name = line.split('CREATE TABLE public.')[1].split(' ')[0].strip('(').strip()
-            tables.append(table_name)
-    
+    # Use Supabase client to get tables
+    response = supabase.table('information_schema.tables').select('table_name').eq('table_schema', 'public').execute()
+    tables = [table['table_name'] for table in response.data]
     return tables
 
 def get_table_schema(connection_string, table_name):
     """Get the schema for a specific table."""
-    cmd = [
-        "pg_dump",
-        "--schema-only",
-        "--no-owner",
-        "--no-acl",
-        "--table=public." + table_name,
-        connection_string
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        print(f"Error getting schema for table {table_name}: {result.stderr}")
-        return None
-    
-    return result.stdout
+    # Use Supabase client to get table schema
+    response = supabase.table('information_schema.columns').select('column_name, data_type').eq('table_schema', 'public').eq('table_name', table_name).execute()
+    schema_sql = f"CREATE TABLE public.{table_name} (\n"
+    for column in response.data:
+        schema_sql += f"    {column['column_name']} {column['data_type']},\n"
+    schema_sql = schema_sql.rstrip(',\n') + "\n);"
+    return schema_sql
 
 def get_full_schema(connection_string):
     """Get the full schema of the database."""
@@ -159,26 +110,13 @@ def get_full_schema(connection_string):
 
 def execute_sql(connection_string, sql):
     """Execute SQL commands against a database."""
-    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sql') as temp_file:
-        temp_file.write(sql)
-        temp_file_path = temp_file.name
-    
-    cmd = [
-        "psql",
-        connection_string,
-        "-f", temp_file_path
-    ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    
-    # Clean up the temporary file
-    os.unlink(temp_file_path)
-    
-    if result.returncode != 0:
-        print(f"Error executing SQL: {result.stderr}")
+    # Use Supabase client to execute SQL
+    try:
+        supabase.rpc('exec_sql', {'sql': sql}).execute()
+        return True
+    except Exception as e:
+        print(f"Error executing SQL: {e}")
         return False
-    
-    return True
 
 def sync_schema(source_conn, target_conn, only_missing=False):
     """
@@ -192,12 +130,14 @@ def sync_schema(source_conn, target_conn, only_missing=False):
     Returns:
     - list of tables that were synced
     """
+    print("Syncing schema from source to target...")
     source_tables = get_tables(source_conn)
     
     if not source_tables:
         print("No tables found in the source database.")
         return []
     
+    print("Getting tables from target database...")
     target_tables = get_tables(target_conn)
     
     tables_to_sync = []
@@ -427,7 +367,9 @@ def main():
     elif args.mode == "both":
         source_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
         target_conn = get_db_connection_string(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
+        print("Starting sync from production to staging...")
         sync_schema(source_conn, target_conn, args.only_missing)
+        print("Starting sync from staging to production...")
         sync_schema(target_conn, source_conn, args.only_missing)
 
 if __name__ == "__main__":
