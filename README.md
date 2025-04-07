@@ -1,6 +1,6 @@
-# Supabase Schema Sync
+# AI-Powered Supabase Administration Script
 
-A Python utility for syncing and cloning schemas between Supabase projects and local PostgreSQL databases.
+This project is an AI-powered script designed to manage and administer Supabase projects. It will include features for syncing and cloning schemas between Supabase projects and local PostgreSQL databases, with the addition of AI capabilities to enhance automation and efficiency.
 
 ## Features
 
