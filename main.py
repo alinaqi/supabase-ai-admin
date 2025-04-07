@@ -25,6 +25,21 @@ SUPABASE_CLIENT_MAP = {}
 # Load .env file
 load_dotenv()
 
+def get_db_connection_string(url, service_key):
+    """Extract host and database from Supabase URL and create a PostgreSQL connection string."""
+    if not url or not service_key:
+        return None
+        
+    # Extract the host from the URL (remove https:// and trailing slash if present)
+    host = url.replace("https://", "").strip("/").split(".")[0]
+    db_host = f"db.{host}.supabase.co"  # Add 'db.' prefix to host
+    db_port = 5432
+    db_name = "postgres"
+    db_user = "postgres"
+    db_password = service_key
+    
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
 # Initialize environment variables
 def initialize_env_vars():
     global PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY, STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY, LOCAL_PG_CONNECTION, ANTHROPIC_API_KEY, supabase, SUPABASE_CLIENT_MAP
@@ -153,21 +168,6 @@ def check_environment_vars(mode):
         print("\nPlease set these variables in your environment or create a .env file with the following format:")
         print("\n".join([f"{var}=your_{var.lower()}_value" for var in missing_vars]))
         exit(1)
-
-def get_db_connection_string(url, service_key):
-    """Extract host and database from Supabase URL and create a PostgreSQL connection string."""
-    if not url or not service_key:
-        return None
-        
-    # Extract the host from the URL (remove https:// and trailing slash if present)
-    host = url.replace("https://", "").strip("/").split(".")[0]
-    db_host = f"db.{host}.supabase.co"  # Add 'db.' prefix to host
-    db_port = 5432
-    db_name = "postgres"
-    db_user = "postgres"
-    db_password = service_key
-    
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
 def get_tables(connection_string):
     """Get all user-defined tables in the public schema."""
