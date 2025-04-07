@@ -64,7 +64,7 @@ def get_db_connection_string(url, service_key):
         
     # Extract the host from the URL (remove https:// and trailing slash if present)
     host = url.replace("https://", "").strip("/").split(".")[0]
-    db_host = f"{host}.supabase.co"
+    db_host = f"db.{host}.supabase.co"  # Add 'db.' prefix to host
     db_port = 5432
     db_name = "postgres"
     db_user = "postgres"
