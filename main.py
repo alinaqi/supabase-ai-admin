@@ -12,27 +12,124 @@ import sys
 from tqdm import tqdm
 from supabase import create_client, Client
 
-# Load environment variables from .env file (if it exists)
+# Global variables
+PROD_SUPABASE_URL = None
+PROD_SUPABASE_SERVICE_KEY = None
+STAGING_SUPABASE_URL = None
+STAGING_SUPABASE_SERVICE_KEY = None
+LOCAL_PG_CONNECTION = None
+ANTHROPIC_API_KEY = None
+supabase = None
+SUPABASE_CLIENT_MAP = {}
+
+# Load .env file
 load_dotenv()
 
-# Configuration for production
-PROD_SUPABASE_URL = os.getenv("PROD_SUPABASE_URL")
-PROD_SUPABASE_PUBLIC_KEY = os.getenv("PROD_SUPABASE_PUBLIC_KEY")
-PROD_SUPABASE_SERVICE_KEY = os.getenv("PROD_SUPABASE_SERVICE_KEY")
+# Initialize environment variables
+def initialize_env_vars():
+    global PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY, STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY, LOCAL_PG_CONNECTION, ANTHROPIC_API_KEY, supabase, SUPABASE_CLIENT_MAP
+    
+    PROD_SUPABASE_URL = os.getenv("PROD_SUPABASE_URL")
+    PROD_SUPABASE_SERVICE_KEY = os.getenv("PROD_SUPABASE_SERVICE_KEY")
+    STAGING_SUPABASE_URL = os.getenv("STAGING_SUPABASE_URL")
+    STAGING_SUPABASE_SERVICE_KEY = os.getenv("STAGING_SUPABASE_SERVICE_KEY")
+    LOCAL_PG_CONNECTION = os.getenv("LOCAL_PG_CONNECTION", "postgresql://postgres:postgres@localhost:5432/postgres")
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+    
+    # Initialize Supabase clients
+    if PROD_SUPABASE_URL and PROD_SUPABASE_SERVICE_KEY:
+        prod_client = create_client(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
+        supabase = prod_client  # Default client
+        
+        # Store in connection map
+        prod_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
+        SUPABASE_CLIENT_MAP[prod_conn] = prod_client
+        
+        # Create exec_sql function if it doesn't exist
+        create_exec_sql_function(prod_client)
+    
+    if STAGING_SUPABASE_URL and STAGING_SUPABASE_SERVICE_KEY:
+        staging_client = create_client(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
+        
+        # Store in connection map
+        staging_conn = get_db_connection_string(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
+        SUPABASE_CLIENT_MAP[staging_conn] = staging_client
+        
+        # Create exec_sql function if it doesn't exist
+        create_exec_sql_function(staging_client)
 
-# Configuration for staging
-STAGING_SUPABASE_URL = os.getenv("STAGING_SUPABASE_URL")
-STAGING_SUPABASE_PUBLIC_KEY = os.getenv("STAGING_SUPABASE_PUBLIC_KEY")
-STAGING_SUPABASE_SERVICE_KEY = os.getenv("STAGING_SUPABASE_SERVICE_KEY")
+def create_exec_sql_function(client):
+    """Create the exec_sql function in Supabase if it doesn't exist."""
+    try:
+        # First try to see if the function already works
+        test_sql = "SELECT 1 as test"
+        try:
+            response = client.rpc('exec_sql', {'sql': test_sql}).execute()
+            if hasattr(response, 'data') and response.data and 'test' in response.data[0]:
+                print("exec_sql function already exists and works correctly.")
+                return True
+        except Exception as test_error:
+            print(f"The exec_sql function needs to be created: {test_error}")
+            
+        # SQL for creating the exec_sql function
+        create_function_sql = """
+        CREATE OR REPLACE FUNCTION exec_sql(sql text)
+        RETURNS JSONB
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        AS $$
+        DECLARE
+            result JSONB;
+        BEGIN
+            EXECUTE sql INTO result;
+            RETURN result;
+        EXCEPTION
+            WHEN others THEN
+                -- Return error but don't raise it
+                RETURN jsonb_build_object(
+                    'error', SQLERRM,
+                    'detail', SQLSTATE
+                );
+        END;
+        $$;
+        """
+        
+        # Execute the SQL to create the function using a direct approach
+        direct_query = f"""
+        DO $$ 
+        BEGIN
+            {create_function_sql}
+        EXCEPTION 
+            WHEN others THEN 
+                RAISE NOTICE 'Error creating function: %', SQLERRM;
+        END $$;
+        """
+        
+        # Try to execute using REST API directly
+        print("Creating exec_sql function...")
+        response = client.postgrest.rpc('exec_sql', {'sql': direct_query}).execute()
+        
+        # Test if the function was created successfully
+        try:
+            test_response = client.rpc('exec_sql', {'sql': test_sql}).execute()
+            if hasattr(test_response, 'data') and test_response.data:
+                print("exec_sql function created successfully.")
+                return True
+            else:
+                print("exec_sql function may not have been created correctly.")
+                print(f"Test response: {test_response}")
+                return False
+        except Exception as verify_error:
+            print(f"Failed to verify exec_sql function: {verify_error}")
+            return False
+        
+    except Exception as e:
+        print(f"Error creating exec_sql function: {e}")
+        print("Some operations may fail without this function.")
+        return False
 
-# Configuration for local PostgreSQL
-LOCAL_PG_CONNECTION = os.getenv("LOCAL_PG_CONNECTION", "postgresql://postgres:postgres@localhost:5432/postgres")
-
-# Anthropic API Key
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-
-# Initialize Supabase client
-supabase: Client = create_client(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
+# Call initialization
+initialize_env_vars()
 
 def check_environment_vars(mode):
     """Check if all required environment variables are set based on the mode."""
@@ -75,33 +172,30 @@ def get_db_connection_string(url, service_key):
 def get_tables(connection_string):
     """Get all user-defined tables in the public schema."""
     try:
-        # Use pg_dump to get schema, then parse it to find table definitions
-        cmd = [
-            "pg_dump",
-            "--schema-only",
-            "--no-owner",
-            "--no-acl",
-            "--schema=public",
-            connection_string
-        ]
+        # Use direct SQL query via Supabase client
+        sql = """
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+        """
         
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Error getting tables: {result.stderr}")
+        # Extract Supabase client from connection string
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
+            response = client.rpc('exec_sql', {'sql': sql}).execute()
+            
+            if hasattr(response, 'data') and response.data:
+                tables = [item.get('table_name') for item in response.data]
+                return tables
+            else:
+                print(f"No data returned from Supabase query: {response}")
+                return []
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
             return []
-        
-        # Parse the output to find CREATE TABLE statements
-        tables = []
-        lines = result.stdout.split('\n')
-        for i, line in enumerate(lines):
-            if line.startswith('CREATE TABLE public.'):
-                # Extract table name from CREATE TABLE statement
-                table_name = line.split('CREATE TABLE public.')[1].split('(')[0].strip()
-                if table_name:
-                    tables.append(table_name)
-        
-        return tables
+            
     except Exception as e:
         print(f"Error getting tables: {e}")
         return []
@@ -109,24 +203,77 @@ def get_tables(connection_string):
 def get_table_schema(connection_string, table_name):
     """Get the schema for a specific table."""
     try:
-        # Use pg_dump to get the schema for the specific table
-        cmd = [
-            "pg_dump",
-            "--schema-only",
-            "--no-owner",
-            "--no-acl",
-            "--schema=public",
-            "--table=public." + table_name,
-            connection_string
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Error getting table schema: {result.stderr}")
+        # Use Supabase client to get table schema
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
+            
+            # Get columns
+            columns_sql = f"""
+            SELECT column_name, data_type, 
+                   is_nullable, column_default,
+                   character_maximum_length
+            FROM information_schema.columns 
+            WHERE table_schema = 'public' 
+            AND table_name = '{table_name}'
+            ORDER BY ordinal_position
+            """
+            
+            response = client.rpc('exec_sql', {'sql': columns_sql}).execute()
+            
+            if not hasattr(response, 'data') or not response.data:
+                print(f"No columns found for table {table_name}")
+                return None
+                
+            # Construct CREATE TABLE statement
+            schema_sql = f"CREATE TABLE public.{table_name} (\n"
+            
+            for column in response.data:
+                col_name = column.get('column_name')
+                data_type = column.get('data_type')
+                is_nullable = column.get('is_nullable', 'YES')
+                default = column.get('column_default')
+                max_length = column.get('character_maximum_length')
+                
+                # Add length to character types if specified
+                if max_length and data_type in ('character varying', 'character'):
+                    data_type = f"{data_type}({max_length})"
+                
+                # Build column definition
+                col_def = f"    {col_name} {data_type}"
+                
+                if default:
+                    col_def += f" DEFAULT {default}"
+                    
+                if is_nullable == 'NO':
+                    col_def += " NOT NULL"
+                    
+                schema_sql += col_def + ",\n"
+            
+            # Get primary key
+            pk_sql = f"""
+            SELECT c.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_name)
+            JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema
+              AND c.table_name = tc.table_name AND c.column_name = ccu.column_name
+            WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = '{table_name}'
+            """
+            
+            pk_response = client.rpc('exec_sql', {'sql': pk_sql}).execute()
+            
+            if hasattr(pk_response, 'data') and pk_response.data:
+                pk_columns = [col.get('column_name') for col in pk_response.data]
+                if pk_columns:
+                    schema_sql += f"    PRIMARY KEY ({', '.join(pk_columns)})\n"
+            
+            # Remove trailing comma and close the statement
+            schema_sql = schema_sql.rstrip(",\n") + "\n);"
+            
+            return schema_sql
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
             return None
-        
-        return result.stdout
+            
     except Exception as e:
         print(f"Error getting table schema: {e}")
         return None
@@ -153,22 +300,26 @@ def get_full_schema(connection_string):
 def execute_sql(connection_string, sql):
     """Execute SQL commands against a database."""
     try:
-        # Create a temporary file with the SQL
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
-            f.write(sql)
-            temp_file = f.name
-
-        # Execute the SQL using psql
-        cmd = ['psql', connection_string, '-f', temp_file]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        # Clean up the temporary file
-        os.unlink(temp_file)
-
-        if result.returncode != 0:
-            print(f"Error executing SQL: {result.stderr}")
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
+            
+            # Split SQL by semicolons to execute multiple statements
+            statements = [stmt.strip() for stmt in sql.split(';') if stmt.strip()]
+            
+            for stmt in statements:
+                if stmt:
+                    print(f"Executing SQL: {stmt[:60]}...")  # Preview first 60 chars
+                    response = client.rpc('exec_sql', {'sql': stmt}).execute()
+                    
+                    if hasattr(response, 'error') and response.error:
+                        print(f"Error executing SQL: {response.error}")
+                        return False
+            
+            return True
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
             return False
-        return True
+            
     except Exception as e:
         print(f"Error executing SQL: {e}")
         return False
@@ -465,42 +616,35 @@ def get_anthropic_guidance():
 def get_functions(connection_string):
     """Get all user-defined functions in the public schema."""
     try:
-        # Use pg_dump to get schema with functions
-        cmd = [
-            "pg_dump",
-            "--schema-only",
-            "--no-owner",
-            "--no-acl",
-            "--schema=public",
-            connection_string
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Error getting functions: {result.stderr}")
-            return []
-        
-        # Parse the output to find CREATE FUNCTION statements
-        functions = []
-        lines = result.stdout.split('\n')
-        for i, line in enumerate(lines):
-            if line.startswith('CREATE FUNCTION public.') or line.startswith('CREATE OR REPLACE FUNCTION public.'):
-                # Extract function definition
-                func_start = i
-                func_name = line.split('FUNCTION public.')[1].split('(')[0].strip()
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
+            
+            # Query to get function definitions
+            functions_sql = """
+            SELECT n.nspname as schema_name,
+                   p.proname as function_name,
+                   pg_get_functiondef(p.oid) as function_definition
+            FROM pg_proc p
+            JOIN pg_namespace n ON p.pronamespace = n.oid
+            WHERE n.nspname = 'public'
+            """
+            
+            response = client.rpc('exec_sql', {'sql': functions_sql}).execute()
+            
+            if not hasattr(response, 'data') or not response.data:
+                return []
                 
-                # Find the end of the function definition
-                func_end = func_start
-                for j in range(func_start, len(lines)):
-                    if lines[j].strip().endswith(';'):
-                        func_end = j
-                        break
-                
-                func_def = '\n'.join(lines[func_start:func_end+1])
+            functions = []
+            for func in response.data:
+                func_name = func.get('function_name')
+                func_def = func.get('function_definition')
                 functions.append((func_name, func_def))
-        
-        return functions
+                
+            return functions
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
+            return []
+            
     except Exception as e:
         print(f"Error getting functions: {e}")
         return []
@@ -508,41 +652,42 @@ def get_functions(connection_string):
 def get_triggers(connection_string):
     """Get all triggers in the public schema."""
     try:
-        # Use pg_dump to get schema with triggers
-        cmd = [
-            "pg_dump",
-            "--schema-only",
-            "--no-owner",
-            "--no-acl",
-            "--schema=public",
-            connection_string
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Error getting triggers: {result.stderr}")
-            return []
-        
-        # Parse the output to find CREATE TRIGGER statements
-        triggers = []
-        lines = result.stdout.split('\n')
-        for i, line in enumerate(lines):
-            if line.startswith('CREATE TRIGGER'):
-                # Extract trigger definition
-                trig_start = i
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
+            
+            # Query to get trigger definitions
+            triggers_sql = """
+            SELECT trigger_name,
+                   event_manipulation,
+                   action_timing,
+                   action_statement,
+                   event_object_table
+            FROM information_schema.triggers
+            WHERE trigger_schema = 'public'
+            """
+            
+            response = client.rpc('exec_sql', {'sql': triggers_sql}).execute()
+            
+            if not hasattr(response, 'data') or not response.data:
+                return []
                 
-                # Find the end of the trigger definition
-                trig_end = trig_start
-                for j in range(trig_start, len(lines)):
-                    if lines[j].strip().endswith(';'):
-                        trig_end = j
-                        break
+            triggers = []
+            for trig in response.data:
+                trig_name = trig.get('trigger_name')
+                event = trig.get('event_manipulation')
+                timing = trig.get('action_timing')
+                statement = trig.get('action_statement')
+                table = trig.get('event_object_table')
                 
-                trig_def = '\n'.join(lines[trig_start:trig_end+1])
+                # Reconstruct CREATE TRIGGER statement
+                trig_def = f"CREATE TRIGGER {trig_name} {timing} {event} ON public.{table} FOR EACH ROW {statement};"
                 triggers.append(trig_def)
-        
-        return triggers
+                
+            return triggers
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
+            return []
+            
     except Exception as e:
         print(f"Error getting triggers: {e}")
         return []
@@ -550,45 +695,92 @@ def get_triggers(connection_string):
 def get_rls_policies(connection_string):
     """Get all RLS policies in the public schema."""
     try:
-        # Use pg_dump to get schema with RLS policies
-        cmd = [
-            "pg_dump",
-            "--schema-only",
-            "--no-owner",
-            "--no-acl",
-            "--schema=public",
-            connection_string
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            print(f"Error getting RLS policies: {result.stderr}")
-            return []
-        
-        # Parse the output to find ALTER TABLE ... ENABLE ROW LEVEL SECURITY and CREATE POLICY statements
-        rls_settings = []
-        policies = []
-        lines = result.stdout.split('\n')
-        for i, line in enumerate(lines):
-            if 'ENABLE ROW LEVEL SECURITY' in line:
-                rls_settings.append(line.strip())
+        if SUPABASE_CLIENT_MAP.get(connection_string):
+            client = SUPABASE_CLIENT_MAP[connection_string]
             
-            if line.startswith('CREATE POLICY'):
-                # Extract policy definition
-                policy_start = i
-                
-                # Find the end of the policy definition
-                policy_end = policy_start
-                for j in range(policy_start, len(lines)):
-                    if lines[j].strip().endswith(';'):
-                        policy_end = j
-                        break
-                
-                policy_def = '\n'.join(lines[policy_start:policy_end+1])
-                policies.append(policy_def)
-        
-        return rls_settings + policies
+            # Query to get tables with RLS enabled
+            rls_tables_sql = """
+            SELECT tablename
+            FROM pg_tables
+            WHERE schemaname = 'public'
+              AND tableowner = 'postgres'
+              AND EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON c.relnamespace = n.oid
+                WHERE n.nspname = 'public'
+                  AND c.relname = tablename
+                  AND c.relrowsecurity = true
+              )
+            """
+            
+            tables_response = client.rpc('exec_sql', {'sql': rls_tables_sql}).execute()
+            
+            rls_settings = []
+            
+            if hasattr(tables_response, 'data') and tables_response.data:
+                for table in tables_response.data:
+                    table_name = table.get('tablename')
+                    rls_settings.append(f"ALTER TABLE public.{table_name} ENABLE ROW LEVEL SECURITY;")
+            
+            # Query to get RLS policies
+            policies_sql = """
+            SELECT pcl.relname as table_name,
+                   pol.polname as policy_name,
+                   CASE WHEN pol.polpermissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END as permissive,
+                   pol.polcmd as command,
+                   pg_catalog.pg_get_expr(pol.polqual, pol.polrelid) as using_expr,
+                   pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid) as with_check_expr,
+                   ARRAY(SELECT pg_catalog.quote_ident(username)
+                         FROM pg_catalog.pg_authid
+                         WHERE oid = ANY(pol.polroles)) as roles
+            FROM pg_catalog.pg_policy pol
+            JOIN pg_catalog.pg_class pcl ON pcl.oid = pol.polrelid
+            JOIN pg_catalog.pg_namespace nsp ON nsp.oid = pcl.relnamespace
+            WHERE nsp.nspname = 'public'
+            """
+            
+            policies_response = client.rpc('exec_sql', {'sql': policies_sql}).execute()
+            
+            policies = []
+            
+            if hasattr(policies_response, 'data') and policies_response.data:
+                for policy in policies_response.data:
+                    table_name = policy.get('table_name')
+                    policy_name = policy.get('policy_name')
+                    permissive = policy.get('permissive')
+                    command = policy.get('command')
+                    using_expr = policy.get('using_expr')
+                    with_check_expr = policy.get('with_check_expr')
+                    roles = policy.get('roles', [])
+                    
+                    # Format roles string
+                    roles_str = 'PUBLIC' if 'PUBLIC' in roles else ', '.join(roles)
+                    
+                    # Build policy definition
+                    policy_def = f"CREATE POLICY {policy_name} ON public.{table_name}"
+                    
+                    if permissive != 'PERMISSIVE':
+                        policy_def += f" AS {permissive}"
+                        
+                    if command != 'ALL':
+                        policy_def += f" FOR {command}"
+                        
+                    policy_def += f" TO {roles_str}"
+                    
+                    if using_expr:
+                        policy_def += f" USING ({using_expr})"
+                        
+                    if with_check_expr:
+                        policy_def += f" WITH CHECK ({with_check_expr})"
+                        
+                    policy_def += ";"
+                    policies.append(policy_def)
+            
+            return rls_settings + policies
+        else:
+            print(f"No Supabase client found for connection: {connection_string}")
+            return []
+            
     except Exception as e:
         print(f"Error getting RLS policies: {e}")
         return []
