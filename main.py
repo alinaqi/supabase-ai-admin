@@ -74,20 +74,62 @@ def get_db_connection_string(url, service_key):
 
 def get_tables(connection_string):
     """Get all user-defined tables in the public schema."""
-    # Use Supabase client to get tables
-    response = supabase.table('information_schema.tables').select('table_name').eq('table_schema', 'public').execute()
-    tables = [table['table_name'] for table in response.data]
-    return tables
+    try:
+        # Use pg_dump to get schema, then parse it to find table definitions
+        cmd = [
+            "pg_dump",
+            "--schema-only",
+            "--no-owner",
+            "--no-acl",
+            "--schema=public",
+            connection_string
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting tables: {result.stderr}")
+            return []
+        
+        # Parse the output to find CREATE TABLE statements
+        tables = []
+        lines = result.stdout.split('\n')
+        for i, line in enumerate(lines):
+            if line.startswith('CREATE TABLE public.'):
+                # Extract table name from CREATE TABLE statement
+                table_name = line.split('CREATE TABLE public.')[1].split('(')[0].strip()
+                if table_name:
+                    tables.append(table_name)
+        
+        return tables
+    except Exception as e:
+        print(f"Error getting tables: {e}")
+        return []
 
 def get_table_schema(connection_string, table_name):
     """Get the schema for a specific table."""
-    # Use Supabase client to get table schema
-    response = supabase.table('information_schema.columns').select('column_name, data_type').eq('table_schema', 'public').eq('table_name', table_name).execute()
-    schema_sql = f"CREATE TABLE public.{table_name} (\n"
-    for column in response.data:
-        schema_sql += f"    {column['column_name']} {column['data_type']},\n"
-    schema_sql = schema_sql.rstrip(',\n') + "\n);"
-    return schema_sql
+    try:
+        # Use pg_dump to get the schema for the specific table
+        cmd = [
+            "pg_dump",
+            "--schema-only",
+            "--no-owner",
+            "--no-acl",
+            "--schema=public",
+            "--table=public." + table_name,
+            connection_string
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting table schema: {result.stderr}")
+            return None
+        
+        return result.stdout
+    except Exception as e:
+        print(f"Error getting table schema: {e}")
+        return None
 
 def get_full_schema(connection_string):
     """Get the full schema of the database."""
@@ -110,9 +152,22 @@ def get_full_schema(connection_string):
 
 def execute_sql(connection_string, sql):
     """Execute SQL commands against a database."""
-    # Use Supabase client to execute SQL
     try:
-        supabase.rpc('exec_sql', {'sql': sql}).execute()
+        # Create a temporary file with the SQL
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
+            f.write(sql)
+            temp_file = f.name
+
+        # Execute the SQL using psql
+        cmd = ['psql', connection_string, '-f', temp_file]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        # Clean up the temporary file
+        os.unlink(temp_file)
+
+        if result.returncode != 0:
+            print(f"Error executing SQL: {result.stderr}")
+            return False
         return True
     except Exception as e:
         print(f"Error executing SQL: {e}")
@@ -120,28 +175,47 @@ def execute_sql(connection_string, sql):
 
 def sync_schema(source_conn, target_conn, only_missing=False):
     """
-    Sync schema from source to target.
+    Sync schema from source to target, including tables, functions, triggers, and RLS policies.
     
     Parameters:
     - source_conn: Connection string for the source database
     - target_conn: Connection string for the target database
-    - only_missing: If True, only add tables that don't exist in the target
+    - only_missing: If True, only add schema objects that don't exist in the target
     
     Returns:
-    - list of tables that were synced
+    - Summary of synced schema objects
     """
     print("Syncing schema from source to target...")
+    
+    # Get tables from source
+    print("Getting tables from source database...")
     source_tables = get_tables(source_conn)
     
     if not source_tables:
         print("No tables found in the source database.")
-        return []
     
+    # Get tables from target
     print("Getting tables from target database...")
     target_tables = get_tables(target_conn)
     
-    tables_to_sync = []
+    # Get functions from source
+    print("Getting functions from source database...")
+    source_functions = get_functions(source_conn)
     
+    # Get functions from target
+    print("Getting functions from target database...")
+    target_function_names = [f[0] for f in get_functions(target_conn)]
+    
+    # Get triggers from source
+    print("Getting triggers from source database...")
+    source_triggers = get_triggers(source_conn)
+    
+    # Get RLS policies from source
+    print("Getting RLS policies from source database...")
+    source_rls_policies = get_rls_policies(source_conn)
+    
+    # Sync tables
+    tables_to_sync = []
     if only_missing:
         # Only sync tables that don't exist in the target
         tables_to_sync = [t for t in source_tables if t not in target_tables]
@@ -177,19 +251,77 @@ def sync_schema(source_conn, target_conn, only_missing=False):
         else:
             print(f"Failed to sync table: {table}")
     
-    return synced_tables
+    # Sync functions
+    synced_functions = []
+    for func_name, func_def in tqdm(source_functions, desc="Syncing functions"):
+        print(f"Syncing function: {func_name}")
+        
+        # If the function exists in target and we're not only syncing missing functions,
+        # we'll replace it (PostgreSQL functions use CREATE OR REPLACE syntax)
+        if func_name in target_function_names and only_missing:
+            print(f"Skipping existing function: {func_name}")
+            continue
+        
+        # Apply the function definition to the target
+        if execute_sql(target_conn, func_def):
+            synced_functions.append(func_name)
+            print(f"Successfully synced function: {func_name}")
+        else:
+            print(f"Failed to sync function: {func_name}")
+    
+    # Sync triggers (after tables and functions are synced)
+    synced_triggers = []
+    for trigger_def in tqdm(source_triggers, desc="Syncing triggers"):
+        # We need to extract the trigger name for reporting
+        trigger_name = trigger_def.split()[2]  # 'CREATE TRIGGER name ...'
+        print(f"Syncing trigger: {trigger_name}")
+        
+        # Apply the trigger definition to the target
+        if execute_sql(target_conn, trigger_def):
+            synced_triggers.append(trigger_name)
+            print(f"Successfully synced trigger: {trigger_name}")
+        else:
+            print(f"Failed to sync trigger: {trigger_name}")
+    
+    # Sync RLS policies (after tables are synced)
+    synced_policies = []
+    for policy_def in tqdm(source_rls_policies, desc="Syncing RLS policies"):
+        # Extract policy name if it's a CREATE POLICY statement
+        if policy_def.startswith('CREATE POLICY'):
+            policy_name = policy_def.split()[2]  # 'CREATE POLICY name ...'
+        else:
+            policy_name = "RLS Setting"  # If it's an ENABLE ROW LEVEL SECURITY statement
+        
+        print(f"Syncing RLS policy/setting: {policy_name}")
+        
+        # Apply the policy definition to the target
+        if execute_sql(target_conn, policy_def):
+            synced_policies.append(policy_name)
+            print(f"Successfully synced RLS policy/setting: {policy_name}")
+        else:
+            print(f"Failed to sync RLS policy/setting: {policy_name}")
+    
+    # Return summary of synced objects
+    return {
+        "tables": synced_tables,
+        "functions": synced_functions,
+        "triggers": synced_triggers,
+        "rls_policies": synced_policies
+    }
 
 def clone_full_schema(source_conn, target_conn):
     """
-    Clone the entire schema from source to target.
+    Clone the entire schema from source to target, including tables, functions, triggers, and RLS policies.
     
     Parameters:
     - source_conn: Connection string for the source database
     - target_conn: Connection string for the target database
     
     Returns:
-    - True if successful, False otherwise
+    - A dictionary with counts of cloned schema objects
     """
+    print("Cloning full schema from source to target...")
+    
     # Get the source schema
     schema_sql = get_full_schema(source_conn)
     
@@ -203,14 +335,21 @@ def clone_full_schema(source_conn, target_conn):
     DECLARE
         r RECORD;
     BEGIN
+        -- Drop all tables
         FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
             EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
+        END LOOP;
+        
+        -- Drop all functions
+        FOR r IN (SELECT proname, oid FROM pg_proc 
+                  WHERE pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')) LOOP
+            EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident(r.proname) || '() CASCADE';
         END LOOP;
     END $$;
     """
     
     if not execute_sql(target_conn, drop_sql):
-        print("Failed to drop existing tables in target database")
+        print("Failed to drop existing objects in target database")
         return False
     
     # Apply the schema to the target
@@ -218,7 +357,23 @@ def clone_full_schema(source_conn, target_conn):
         print("Failed to apply schema to target database")
         return False
     
+    # Get counts of schema objects
+    tables = get_tables(target_conn)
+    functions = get_functions(target_conn)
+    triggers = get_triggers(target_conn)
+    rls_policies = get_rls_policies(target_conn)
+    
     print("Successfully cloned the full schema to the target database")
+    
+    result = {
+        "tables": tables,
+        "functions": [f[0] for f in functions],  # Just the function names
+        "triggers": triggers,
+        "rls_policies": rls_policies
+    }
+    
+    print_summary("Clone", result)
+    
     return True
 
 def clone_data(source_conn, target_conn, table_name):
@@ -307,6 +462,146 @@ def get_anthropic_guidance():
     )
     print(response.content)
 
+def get_functions(connection_string):
+    """Get all user-defined functions in the public schema."""
+    try:
+        # Use pg_dump to get schema with functions
+        cmd = [
+            "pg_dump",
+            "--schema-only",
+            "--no-owner",
+            "--no-acl",
+            "--schema=public",
+            connection_string
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting functions: {result.stderr}")
+            return []
+        
+        # Parse the output to find CREATE FUNCTION statements
+        functions = []
+        lines = result.stdout.split('\n')
+        for i, line in enumerate(lines):
+            if line.startswith('CREATE FUNCTION public.') or line.startswith('CREATE OR REPLACE FUNCTION public.'):
+                # Extract function definition
+                func_start = i
+                func_name = line.split('FUNCTION public.')[1].split('(')[0].strip()
+                
+                # Find the end of the function definition
+                func_end = func_start
+                for j in range(func_start, len(lines)):
+                    if lines[j].strip().endswith(';'):
+                        func_end = j
+                        break
+                
+                func_def = '\n'.join(lines[func_start:func_end+1])
+                functions.append((func_name, func_def))
+        
+        return functions
+    except Exception as e:
+        print(f"Error getting functions: {e}")
+        return []
+
+def get_triggers(connection_string):
+    """Get all triggers in the public schema."""
+    try:
+        # Use pg_dump to get schema with triggers
+        cmd = [
+            "pg_dump",
+            "--schema-only",
+            "--no-owner",
+            "--no-acl",
+            "--schema=public",
+            connection_string
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting triggers: {result.stderr}")
+            return []
+        
+        # Parse the output to find CREATE TRIGGER statements
+        triggers = []
+        lines = result.stdout.split('\n')
+        for i, line in enumerate(lines):
+            if line.startswith('CREATE TRIGGER'):
+                # Extract trigger definition
+                trig_start = i
+                
+                # Find the end of the trigger definition
+                trig_end = trig_start
+                for j in range(trig_start, len(lines)):
+                    if lines[j].strip().endswith(';'):
+                        trig_end = j
+                        break
+                
+                trig_def = '\n'.join(lines[trig_start:trig_end+1])
+                triggers.append(trig_def)
+        
+        return triggers
+    except Exception as e:
+        print(f"Error getting triggers: {e}")
+        return []
+
+def get_rls_policies(connection_string):
+    """Get all RLS policies in the public schema."""
+    try:
+        # Use pg_dump to get schema with RLS policies
+        cmd = [
+            "pg_dump",
+            "--schema-only",
+            "--no-owner",
+            "--no-acl",
+            "--schema=public",
+            connection_string
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            print(f"Error getting RLS policies: {result.stderr}")
+            return []
+        
+        # Parse the output to find ALTER TABLE ... ENABLE ROW LEVEL SECURITY and CREATE POLICY statements
+        rls_settings = []
+        policies = []
+        lines = result.stdout.split('\n')
+        for i, line in enumerate(lines):
+            if 'ENABLE ROW LEVEL SECURITY' in line:
+                rls_settings.append(line.strip())
+            
+            if line.startswith('CREATE POLICY'):
+                # Extract policy definition
+                policy_start = i
+                
+                # Find the end of the policy definition
+                policy_end = policy_start
+                for j in range(policy_start, len(lines)):
+                    if lines[j].strip().endswith(';'):
+                        policy_end = j
+                        break
+                
+                policy_def = '\n'.join(lines[policy_start:policy_end+1])
+                policies.append(policy_def)
+        
+        return rls_settings + policies
+    except Exception as e:
+        print(f"Error getting RLS policies: {e}")
+        return []
+
+def print_summary(direction, result):
+    """Print a summary of synced schema objects"""
+    print(f"\n=== {direction} Sync Summary ===")
+    print(f"Tables: {len(result['tables'])} synced")
+    print(f"Functions: {len(result['functions'])} synced")
+    print(f"Triggers: {len(result['triggers'])} synced")
+    print(f"RLS Policies: {len(result['rls_policies'])} synced")
+    print("===============================")
+
 def main():
     parser = argparse.ArgumentParser(description="AI-Powered Supabase Administration Script")
     parser.add_argument("--mode", choices=["prod-to-staging", "staging-to-prod", "prod-to-local", "staging-to-local", "both"], default="both", help="Operation mode")
@@ -349,11 +644,13 @@ def main():
     if args.mode == "prod-to-staging":
         source_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
         target_conn = get_db_connection_string(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
-        sync_schema(source_conn, target_conn, args.only_missing)
+        result = sync_schema(source_conn, target_conn, args.only_missing)
+        print_summary("Production to Staging", result)
     elif args.mode == "staging-to-prod":
         source_conn = get_db_connection_string(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
         target_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
-        sync_schema(source_conn, target_conn, args.only_missing)
+        result = sync_schema(source_conn, target_conn, args.only_missing)
+        print_summary("Staging to Production", result)
     elif args.mode == "prod-to-local":
         source_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
         clone_full_schema(source_conn, LOCAL_PG_CONNECTION)
@@ -368,9 +665,11 @@ def main():
         source_conn = get_db_connection_string(PROD_SUPABASE_URL, PROD_SUPABASE_SERVICE_KEY)
         target_conn = get_db_connection_string(STAGING_SUPABASE_URL, STAGING_SUPABASE_SERVICE_KEY)
         print("Starting sync from production to staging...")
-        sync_schema(source_conn, target_conn, args.only_missing)
+        result = sync_schema(source_conn, target_conn, args.only_missing)
+        print_summary("Production to Staging", result)
         print("Starting sync from staging to production...")
-        sync_schema(target_conn, source_conn, args.only_missing)
+        result = sync_schema(target_conn, source_conn, args.only_missing)
+        print_summary("Staging to Production", result)
 
 if __name__ == "__main__":
     main()
